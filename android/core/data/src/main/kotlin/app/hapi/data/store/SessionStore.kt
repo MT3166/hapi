@@ -27,10 +27,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonElement
 
 /**
@@ -84,7 +84,7 @@ interface SessionDetailStore : SessionListStore {
     /** Synchronous read of the cached detail (send/permission body building). */
     fun currentDetail(sessionId: String): Session?
 
-    /** Returns the detail from `GET /api/sessions/:id` and updates the cache (chat open / resync). */
+    /** `GET /api/sessions/:id` into the detail cache (chat open / resync). */
     suspend fun loadSessionDetail(sessionId: String): Session
 
     /** Drops a detail nobody observes anymore (chat closed). */
@@ -131,11 +131,16 @@ class SessionStore(
     private val refreshBatchMs: Long = REFRESH_BATCH_MS,
 ) : SessionDetailStore {
 
-    private val list = SnapshotList(snapshotDir, "sessions.json", SessionSummary.serializer(), scope, ::sortSessionSummaries)
-    override val sessions: StateFlow<List<SessionSummary>> = list.values
+    private val snapshot: JsonSnapshotStore<List<SessionSummary>>? = snapshotDir?.let { dir ->
+        JsonSnapshotStore(
+            file = File(dir, "sessions.json"),
+            serializer = ListSerializer(SessionSummary.serializer()),
+            scope = scope,
+        )
+    }
 
-    /** Enables the namespace-specific snapshot after identity is learned. */
-    fun enableSnapshots(dir: File) = list.enableSnapshots(dir)
+    private val _sessions = MutableStateFlow(snapshot?.load()?.let(::sortSessionSummaries) ?: emptyList())
+    override val sessions: StateFlow<List<SessionSummary>> = _sessions.asStateFlow()
 
     private val _details = MutableStateFlow<Map<String, Session>>(emptyMap())
 
@@ -163,10 +168,11 @@ class SessionStore(
 
     override suspend fun loadSessionDetail(sessionId: String): Session {
         val session = api.getSession(sessionId).session
-        return _details.updateAndGet { current -> current + (sessionId to session.copy(
+        _details.update { current -> current + (sessionId to session.copy(
             contentRevision = listOfNotNull(current[sessionId]?.contentRevision, session.contentRevision).maxOrNull(),
             readState = SessionReadState.merge(current[sessionId]?.readState, session.readState),
-        )) }.getValue(sessionId)
+        )) }
+        return _details.value[sessionId] ?: session
     }
 
     override fun releaseDetail(sessionId: String) {
@@ -182,7 +188,7 @@ class SessionStore(
 
     /** Forces the debounced snapshot to disk (app background / tests). */
     suspend fun flushPersistence() {
-        list.flush()
+        snapshot?.flush()
     }
 
     override suspend fun refresh() {
@@ -273,7 +279,7 @@ class SessionStore(
     }
 
     override suspend fun archiveSession(sessionId: String) {
-        val removed = sessions.value.firstOrNull { it.id == sessionId }
+        val removed = _sessions.value.firstOrNull { it.id == sessionId }
         updateSummaries { list -> list.filter { it.id != sessionId } }
         try {
             api.archiveSession(sessionId)
@@ -316,7 +322,7 @@ class SessionStore(
     }
 
     override suspend fun deleteSession(sessionId: String) {
-        val removed = sessions.value.firstOrNull { it.id == sessionId }
+        val removed = _sessions.value.firstOrNull { it.id == sessionId }
         val removedDetail = _details.value[sessionId]
         updateSummaries { list -> list.filter { it.id != sessionId } }
         _details.update { it - sessionId }
@@ -469,7 +475,18 @@ class SessionStore(
         return present
     }
 
-    private fun updateSummaries(transform: (List<SessionSummary>) -> List<SessionSummary>) = list.update(transform)
+    /** CAS update; snapshots only when the transform produced a new list. */
+    private fun updateSummaries(transform: (List<SessionSummary>) -> List<SessionSummary>) {
+        while (true) {
+            val previous = _sessions.value
+            val next = transform(previous)
+            if (next === previous) return
+            if (_sessions.compareAndSet(previous, next)) {
+                snapshot?.scheduleWrite(next)
+                return
+            }
+        }
+    }
 
     private companion object {
         /** `INVALIDATION_BATCH_MS` in the web reference. */

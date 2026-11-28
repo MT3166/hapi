@@ -86,11 +86,9 @@ class PairingViewModelTest {
             requestedUrls += hubUrl
             client
         },
+        credentialStore = credentialStore,
         registry = registry,
-        commitPairing = { credentials ->
-            credentialStore.set(credentials)
-            registry.addHub(credentials.hubUrl)
-        },
+        ioDispatcher = dispatcher,
         nowMs = { 1_234L },
     )
 

@@ -1,10 +1,6 @@
 package app.hapi.companion.feature.share
 
-import app.hapi.companion.feature.chat.composer.ChatDrafts
 import app.hapi.companion.feature.sessions.formatReopenError
-import app.hapi.data.store.MessageWindowStores
-import app.hapi.data.store.SessionDetailStore
-import app.hapi.protocol.wire.Session
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -13,30 +9,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 interface ShareSessionGateway {
-    /** Fresh authenticated detail for the requested source session. */
-    suspend fun loadSession(sessionId: String): Session
+    suspend fun isActive(sessionId: String): Boolean
     /** Includes history seeding and draft migration when the returned ID changes. */
-    suspend fun reopen(sessionId: String, verified: Session): String
-}
-
-internal class StoreShareSessionGateway(
-    private val sessions: SessionDetailStore,
-    private val windows: MessageWindowStores,
-    private val drafts: ChatDrafts,
-) : ShareSessionGateway {
-    override suspend fun loadSession(sessionId: String) = sessions.loadSessionDetail(sessionId)
-
-    override suspend fun reopen(sessionId: String, verified: Session): String {
-        val targetId = sessions.reopenSession(sessionId).sessionId
-        if (targetId != sessionId) {
-            // The source chat may never have been opened since upgrading.
-            // Use its authenticated detail, not the replacement session's ID.
-            windows.recoverLegacyFailedSends(sessionId, verified)
-            windows.seed(sessionId, targetId)
-            drafts.move(sessionId, targetId)
-        }
-        return targetId
-    }
+    suspend fun reopen(sessionId: String): String
 }
 
 data class ShareTargetState(
@@ -59,11 +34,11 @@ class ShareTargetController(private val gateway: ShareSessionGateway, private va
         mutableState.value = ShareTargetState(busy = true)
         scope.launch {
             try {
-                val session = gateway.loadSession(sessionId)
-                mutableState.value = if (!session.active && !confirmReopen) {
+                val active = gateway.isActive(sessionId)
+                mutableState.value = if (!active && !confirmReopen) {
                     ShareTargetState(confirmSessionId = sessionId)
                 } else {
-                    ShareTargetState(resolvedSessionId = if (session.active) sessionId else gateway.reopen(sessionId, session))
+                    ShareTargetState(resolvedSessionId = if (active) sessionId else gateway.reopen(sessionId))
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled

@@ -1,6 +1,5 @@
 package app.hapi.companion.feature.share
 
-import app.hapi.protocol.wire.Session
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -18,16 +17,12 @@ private class TestShareGateway : ShareSessionGateway {
     var fail = false
     var reopens = 0
     var gate: CompletableDeferred<Unit>? = null
-    override suspend fun loadSession(sessionId: String): Session {
+    override suspend fun isActive(sessionId: String): Boolean {
         gate?.await()
         if (fail) error("machine offline")
-        return Session(
-            id = sessionId, namespace = "test", seq = 0, createdAt = 0, updatedAt = 0, active = active,
-            metadataVersion = 0, agentStateVersion = 0, thinking = false, thinkingAt = 0,
-        )
+        return active
     }
-    override suspend fun reopen(sessionId: String, verified: Session): String {
-        assertEquals(sessionId, verified.id)
+    override suspend fun reopen(sessionId: String): String {
         reopens++
         return "replacement-id"
     }

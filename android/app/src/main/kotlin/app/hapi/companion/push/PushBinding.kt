@@ -4,7 +4,6 @@ import android.content.Context
 import com.google.android.gms.tasks.Task
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
-import java.io.IOException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -34,10 +33,17 @@ object PushBinding {
         false // defensive: a broken Firebase runtime must never take the app down
     }
 
-    /** Null only when unconfigured. Propagate lookup failures to the registrar for retry. */
+    /**
+     * Current FCM registration token, or null when push is unavailable or
+     * the fetch failed (offline first start — `onNewToken` covers us later).
+     */
     suspend fun currentToken(context: Context): String? {
         if (!isAvailable(context)) return null
-        return FirebaseMessaging.getInstance().token.awaitTask()
+        return try {
+            FirebaseMessaging.getInstance().token.awaitTask()
+        } catch (_: Exception) {
+            null
+        }
     }
 }
 
@@ -47,7 +53,7 @@ private suspend fun <T> Task<T>.awaitTask(): T = suspendCancellableCoroutine { c
         val error = task.exception
         when {
             error != null -> continuation.resumeWithException(error)
-            task.isCanceled -> continuation.resumeWithException(IOException("Firebase token lookup cancelled"))
+            task.isCanceled -> continuation.cancel()
             else -> continuation.resume(task.result)
         }
     }

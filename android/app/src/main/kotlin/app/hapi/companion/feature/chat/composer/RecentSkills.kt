@@ -6,9 +6,13 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.IOException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -23,19 +27,27 @@ internal fun skillNameKey(name: String): String = name.trim().lowercase()
 
 internal class DataStoreRecentSkills(
     private val dataStore: DataStore<Preferences>,
-    hubUrl: String,
-    namespace: String,
+    private val hubUrl: String,
+    private val namespace: Flow<String?>,
 ) : RecentSkills {
-    private val key = stringPreferencesKey("recent_skills:${hubUrl.length}:$hubUrl:$namespace")
+    private fun key(namespace: String) = stringPreferencesKey("recent_skills:${hubUrl.length}:$hubUrl:$namespace")
 
-    override val names = dataStore.data
-        .catch { error -> if (error is IOException) emit(emptyPreferences()) else throw error }
-        .map { decode(it[key]) }
-        .distinctUntilChanged()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    override val names: Flow<List<String>> = namespace.distinctUntilChanged().flatMapLatest { owner ->
+        if (owner.isNullOrEmpty()) flowOf(emptyList())
+        else {
+            val key = key(owner)
+            dataStore.data
+                .catch { error -> if (error is IOException) emit(emptyPreferences()) else throw error }
+                .map { decode(it[key]) }
+        }
+    }.distinctUntilChanged()
 
     override suspend fun record(name: String) {
         val normalized = skillNameKey(name)
         if (normalized.isEmpty()) return
+        val owner = namespace.first()?.takeIf { it.isNotEmpty() } ?: return
+        val key = key(owner)
         dataStore.edit { prefs ->
             val updated = (listOf(normalized) + decode(prefs[key]).filterNot { it == normalized }).take(LIMIT)
             prefs[key] = Json.encodeToString(updated)

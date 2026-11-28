@@ -12,8 +12,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
@@ -26,7 +28,7 @@ class RecentSkillsTest {
         fun store(scope: CoroutineScope) = PreferenceDataStoreFactory.create(scope = scope) { file }
         val first = SupervisorJob()
         try {
-            val history = DataStoreRecentSkills(store(CoroutineScope(Dispatchers.IO + first)), "https://a.test", "owner")
+            val history = DataStoreRecentSkills(store(CoroutineScope(Dispatchers.IO + first)), "https://a.test", flowOf("owner"))
             history.record("Zebra")
             history.record("Code-Review")
             history.record("ZEBRA")
@@ -37,11 +39,40 @@ class RecentSkillsTest {
         val second = SupervisorJob()
         try {
             val data = store(CoroutineScope(Dispatchers.IO + second))
-            assertEquals(listOf("zebra", "code-review"), DataStoreRecentSkills(data, "https://a.test", "owner").names.first())
-            assertEquals(emptyList(), DataStoreRecentSkills(data, "https://b.test", "owner").names.first())
-            assertEquals(emptyList(), DataStoreRecentSkills(data, "https://a.test", "guest").names.first())
+            assertEquals(listOf("zebra", "code-review"), DataStoreRecentSkills(data, "https://a.test", flowOf("owner")).names.first())
+            assertEquals(emptyList(), DataStoreRecentSkills(data, "https://b.test", flowOf("owner")).names.first())
+            assertEquals(emptyList(), DataStoreRecentSkills(data, "https://a.test", flowOf("guest")).names.first())
         } finally {
             second.cancelAndJoin()
+        }
+    }
+
+    @Test fun `unknown session namespace leaves history disabled until the chat has an identity`() = runTest {
+        val job = SupervisorJob()
+        try {
+            val data = PreferenceDataStoreFactory.create(scope = CoroutineScope(Dispatchers.IO + job)) {
+                File(tmp.root, "session-identity.preferences_pb")
+            }
+            val hub = "https://hub.test"
+            val owner = DataStoreRecentSkills(data, hub, flowOf("owner"))
+            val guest = DataStoreRecentSkills(data, hub, flowOf("guest"))
+            owner.record("Owner Skill")
+            guest.record("Guest Skill")
+            val namespace = MutableStateFlow<String?>(null)
+            val history = DataStoreRecentSkills(data, hub, namespace)
+
+            assertEquals(emptyList(), history.names.first())
+            history.record("Unknown Skill")
+            namespace.value = "owner"
+            assertEquals(listOf("owner skill"), history.names.first())
+            history.record("New Owner Skill")
+            namespace.value = "guest"
+            assertEquals(listOf("guest skill"), history.names.first())
+            namespace.value = null
+            assertEquals(emptyList(), history.names.first())
+            assertEquals(listOf("new owner skill", "owner skill"), owner.names.first())
+        } finally {
+            job.cancelAndJoin()
         }
     }
 
@@ -51,7 +82,7 @@ class RecentSkillsTest {
             val data = PreferenceDataStoreFactory.create(scope = CoroutineScope(Dispatchers.IO + job)) {
                 File(tmp.root, "bounded.preferences_pb")
             }
-            val history = DataStoreRecentSkills(data, "https://hub.test", "default")
+            val history = DataStoreRecentSkills(data, "https://hub.test", flowOf("default"))
             repeat(202) { history.record("Skill-$it") }
             history.record("   ")
             assertEquals((201 downTo 2).map { "skill-$it" }, history.names.first())
@@ -66,7 +97,7 @@ class RecentSkillsTest {
             override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences =
                 throw IOException("unavailable")
         }
-        assertEquals(emptyList(), DataStoreRecentSkills(data, "https://hub.test", "default").names.first())
+        assertEquals(emptyList(), DataStoreRecentSkills(data, "https://hub.test", flowOf("default")).names.first())
     }
 
     @Test fun `recency only breaks ties and never adds skills missing from the catalogue`() {

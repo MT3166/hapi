@@ -14,7 +14,6 @@ import app.hapi.data.api.ChatSessionApi
 import app.hapi.data.api.MessagesQuery
 import app.hapi.data.sse.SseEngine
 import app.hapi.data.sse.SseRawEvent
-import app.hapi.data.sse.SseSubscriptionKey
 import app.hapi.data.sse.SseTransport
 import app.hapi.data.sse.TransportEvent
 import app.hapi.data.store.LastSeenStore
@@ -29,11 +28,8 @@ import app.hapi.data.store.ScratchlistUploadResult
 import app.hapi.data.store.SessionDetailStore
 import app.hapi.data.store.SessionScratchlist
 import app.hapi.data.store.StoreSyncTargets
-import app.hapi.data.store.WindowSnapshots
 import app.hapi.protocol.catalog.PermissionMode
 import app.hapi.protocol.window.MessageStatus
-import app.hapi.protocol.window.PersistedMessageWindow
-import app.hapi.protocol.window.buildOptimisticMessage
 import app.hapi.protocol.wire.AgentState
 import app.hapi.protocol.wire.AgentStateRequest
 import app.hapi.protocol.wire.ApprovePermissionRequest
@@ -79,7 +75,6 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
@@ -99,8 +94,6 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import org.junit.Rule
-import org.junit.rules.TemporaryFolder
 
 private const val IX_SESSION = "sess-1"
 
@@ -488,9 +481,6 @@ private class InteractionHarness(
     detail: Session = detail(),
     val scratchlist: FakeScratchlist? = null,
     recentSkills: RecentSkills? = null,
-    snapshots: WindowSnapshots? = null,
-    legacySnapshots: WindowSnapshots? = null,
-    transport: SseTransport = okTransport(),
 ) {
     val api = RecordingChatApi()
     val scope = testScope.backgroundScope
@@ -499,16 +489,10 @@ private class InteractionHarness(
         setDetail(detail)
     }
     val drafts = FakeDrafts()
-    val messageWindows = MessageWindowStores(
-        api = api,
-        scope = scope,
-        snapshots = snapshots,
-        legacySnapshots = legacySnapshots,
-        snapshotNamespace = if (snapshots != null) "default" else null,
-    )
+    val messageWindows = MessageWindowStores(api = api, scope = scope)
     val engine = SseEngine(
         baseUrl = "http://hub.test",
-        transport = transport,
+        transport = okTransport(),
         tokenProvider = { "jwt" },
         scope = scope,
     )
@@ -539,127 +523,6 @@ private class InteractionHarness(
 // ------------------------------------------------------------------ tests --
 
 class ChatViewModelInteractionTest {
-
-    @get:Rule
-    val temp = TemporaryFolder()
-
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    @Test
-    fun `upgrade restores only authenticated failed sends and does not resend or resurrect them`() = runTest {
-        val legacyDir = temp.newFolder()
-        val legacy = WindowSnapshots(legacyDir, io = Dispatchers.Unconfined)
-        val current = WindowSnapshots(temp.newFolder(), io = Dispatchers.Unconfined)
-        val failed = buildOptimisticMessage("failed", "unsent text", 10, status = MessageStatus.Failed)
-        val duplicate = buildOptimisticMessage("already-sent", "sent text", 20, status = MessageStatus.Sent)
-        val stored = duplicate.copy(wire = duplicate.wire.copy(id = "server-id", seq = 1))
-        val queued = buildOptimisticMessage("queued", "not a failed send", 30, status = MessageStatus.Queued)
-        legacy.save(IX_SESSION, PersistedMessageWindow(
-            messages = listOf(failed, duplicate.copy(status = MessageStatus.Failed), queued, stored),
-            epoch = 99,
-        ))
-        current.save(IX_SESSION, PersistedMessageWindow(messages = listOf(stored), epoch = 1))
-        val original = legacyDir.listFiles()!!.single()
-        val originalJson = original.readText()
-        assertTrue(original.setLastModified(123_000))
-
-        val harness = InteractionHarness(this, snapshots = current, legacySnapshots = legacy)
-        harness.sessionStore.detailToLoad = null // cached detail is not proof of ownership
-        harness.viewModel.start()
-        runCurrent()
-        val window = harness.window()
-        assertTrue(window.state.value.messages.none { it.id == "failed" })
-
-        harness.sessionStore.detailToLoad = detail().copy(namespace = "another-namespace")
-        harness.viewModel.retry()
-        runCurrent()
-        assertTrue(window.state.value.messages.none { it.id == "failed" })
-
-        harness.sessionStore.detailToLoad = detail(id = "redirected")
-        harness.viewModel.retry()
-        runCurrent()
-        assertTrue(window.state.value.messages.none { it.id == "failed" })
-
-        // Keep the destination duplicate represented even if the fake tail reset it.
-        window.ingestSseMessages(listOf(stored))
-        harness.sessionStore.detailToLoad = detail()
-        harness.viewModel.retry()
-        runCurrent()
-        val messages = window.state.value.messages
-        assertEquals(failed, messages.single { it.status == MessageStatus.Failed })
-        assertTrue(messages.none { it.id == "queued" })
-        assertTrue(harness.api.sendCalls.value.isEmpty())
-        val persisted = assertNotNull(current.load(IX_SESSION))
-        assertTrue(persisted.messages.contains(failed))
-        assertTrue(persisted.epoch != 99L)
-        assertEquals(originalJson, original.readText())
-        assertEquals(123_000L, original.lastModified())
-
-        harness.viewModel.retryFailedMessage("failed")
-        runCurrent()
-        val (sessionId, retry) = harness.api.sendCalls.value.single()
-        assertEquals(IX_SESSION, sessionId)
-        assertEquals("unsent text", retry.text)
-        assertEquals("failed", retry.localId)
-
-        // Once no longer retained by the destination window, the recovered row
-        // must not become retryable again when the process restarts.
-        window.removeMessage("failed")
-        val reopened = InteractionHarness(this, snapshots = current, legacySnapshots = legacy)
-        reopened.viewModel.start()
-        runCurrent()
-        assertTrue(reopened.window().state.value.messages.none { it.id == "failed" })
-        assertTrue(reopened.api.sendCalls.value.isEmpty())
-    }
-
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    @Test
-    fun `verified upgrade recovery waits for delayed namespace binding`() = runTest {
-        val legacy = WindowSnapshots(temp.newFolder(), io = Dispatchers.Unconfined)
-        val current = WindowSnapshots(temp.newFolder(), io = Dispatchers.Unconfined)
-        val failed = buildOptimisticMessage("failed", "unsent text", 10, status = MessageStatus.Failed)
-        legacy.save(IX_SESSION, PersistedMessageWindow(messages = listOf(failed)))
-        val harness = InteractionHarness(this, legacySnapshots = legacy)
-        harness.viewModel.start()
-        runCurrent()
-        assertTrue("loadDetail:$IX_SESSION" in harness.sessionStore.calls.value)
-        assertTrue(harness.window().state.value.messages.isEmpty())
-
-        harness.messageWindows.enableSnapshots(current, "default")
-        runCurrent()
-        assertEquals(listOf(failed), harness.window().state.value.messages)
-        assertEquals(listOf(failed), current.load(IX_SESSION)?.messages)
-        assertTrue(harness.api.sendCalls.value.isEmpty())
-    }
-
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    @Test
-    fun `offline upgrade recovers failed sends when the open chat reconnects`() = runTest {
-        val legacy = WindowSnapshots(temp.newFolder(), io = Dispatchers.Unconfined)
-        val current = WindowSnapshots(temp.newFolder(), io = Dispatchers.Unconfined)
-        val failed = buildOptimisticMessage("failed", "unsent text", 10, status = MessageStatus.Failed)
-        legacy.save(IX_SESSION, PersistedMessageWindow(messages = listOf(failed)))
-        val online = okTransport()
-        var attempts = 0
-        val transport = object : SseTransport {
-            override fun open(url: String, lastEventId: String?) = if (attempts++ == 0) {
-                flow { emit(TransportEvent.Failure(code = null)) }
-            } else online.open(url, lastEventId)
-        }
-        val harness = InteractionHarness(this, snapshots = current, legacySnapshots = legacy, transport = transport)
-        harness.sessionStore.detailToLoad = null
-        harness.viewModel.start()
-        runCurrent()
-        assertEquals(1, harness.sessionStore.calls.value.count { it == "loadDetail:$IX_SESSION" })
-        assertTrue(harness.window().state.value.messages.isEmpty())
-
-        harness.sessionStore.detailToLoad = detail()
-        harness.engine.requestReconnect(SseSubscriptionKey.Session(IX_SESSION))
-        runCurrent()
-        assertEquals(2, attempts)
-        assertEquals(2, harness.sessionStore.calls.value.count { it == "loadDetail:$IX_SESSION" })
-        assertEquals(listOf(failed), current.load(IX_SESSION)?.messages)
-        assertTrue(harness.api.sendCalls.value.isEmpty())
-    }
 
     private fun planDetail(): Session = detail(
         flavor = "codex", agentState = AgentState(codexPlanProposalId = "plan-1"),
@@ -2510,20 +2373,26 @@ class ChatViewModelInteractionTest {
     }
 
     @Test
-    fun `typing a dot or qualifier before existing text keeps the same skill picker open`() = runTest {
+    fun `typing dots or colons before existing text keeps the same skill picker open`() = runTest {
         val harness = InteractionHarness(this)
         val vm = harness.viewModel
         val dotted = SkillSummary("foo.bar")
         val qualified = SkillSummary("plugin:review")
-        harness.api.skillsResult = SkillsResponse(success = true, skills = listOf(dotted, qualified))
+        val doubleDot = SkillSummary("guide..lint")
+        val doubleColon = SkillSummary("tools::review")
+        harness.api.skillsResult = SkillsResponse(success = true, skills = listOf(dotted, qualified, doubleDot, doubleColon))
         vm.start()
 
         for ((prefix, punctuation, next, skill) in listOf(
             listOf("foo", ".", "b", dotted.name),
             listOf("plugin", ":", "r", qualified.name),
+            listOf("guide", "..", "l", doubleDot.name),
+            listOf("tools", "::", "r", doubleColon.name),
         )) {
             val before = harness.api.skillsCalls.size
-            for (term in listOf(prefix, prefix + punctuation, prefix + punctuation + next)) {
+            val queries = listOf(prefix) + (1..punctuation.length).map { prefix + punctuation.take(it) } +
+                (prefix + punctuation + next)
+            for (term in queries) {
                 val typed = "Run \$$term"
                 vm.onComposerChange("$typed then continue", typed.length, typed.length)
                 testScheduler.runCurrent()
@@ -2586,7 +2455,7 @@ class ChatViewModelInteractionTest {
         val harness = InteractionHarness(this)
         val vm = harness.viewModel
         val plain = SkillSummary("review")
-        val skills = listOf(SkillSummary("review."), SkillSummary("review:"))
+        val skills = listOf(SkillSummary("review."), SkillSummary("review:"), SkillSummary("review..."), SkillSummary("review::"))
         harness.api.skillsResult = SkillsResponse(success = true, skills = skills + plain)
         vm.start()
 
@@ -2599,7 +2468,7 @@ class ChatViewModelInteractionTest {
                 vm.selectSkillSuggestion(vm.skillSuggestions.value.single { it.skill == skill })
                 testScheduler.runCurrent()
                 assertEquals(if (suffix.isEmpty()) "$draft " else draft, vm.composer.value.text, draft)
-                assertEquals(caret + 2, vm.composer.value.caretPosition)
+                assertEquals("Run \$${skill.name} ".length, vm.composer.value.caretPosition)
 
                 vm.onComposerChange(draft, caret, caret)
                 testScheduler.runCurrent()
@@ -2607,6 +2476,47 @@ class ChatViewModelInteractionTest {
                 testScheduler.runCurrent()
                 assertEquals(draft, vm.composer.value.text, "Preserve punctuation when selecting the shorter name")
             }
+        }
+        assertTrue(harness.api.sendCalls.value.isEmpty())
+    }
+
+    @Test
+    fun `consecutive punctuation is replaced only when it belongs to the skill`() = runTest {
+        val harness = InteractionHarness(this)
+        val vm = harness.viewModel
+        val plain = SkillSummary("tools")
+        val qualified = SkillSummary("tools::review")
+        val other = SkillSummary("tools::lint")
+        val dotted = SkillSummary("tools..review")
+        harness.api.skillsResult = SkillsResponse(success = true, skills = listOf(plain, qualified, other, dotted))
+        vm.start()
+
+        val prefix = "Run \$tools"
+        val caret = prefix.length
+        for ((suffix, skill, expectedSuffix) in listOf(
+            Triple("::review please", qualified, " please"),
+            Triple("::review，然后继续", other, "，然后继续"),
+            Triple("..review+\$lint", dotted, "+\$lint"),
+            Triple("..rev please", dotted, " please"),
+            Triple(":: Then continue", qualified, ":: Then continue"),
+            Triple("... Then continue", dotted, "... Then continue"),
+            Triple("::continue please", plain, "::continue please"),
+            Triple("::continue please", qualified, "::continue please"),
+        )) {
+            vm.onComposerChange(prefix + suffix, caret, caret)
+            testScheduler.runCurrent()
+            vm.selectSkillSuggestion(vm.skillSuggestions.value.single { it.skill == skill })
+            testScheduler.runCurrent()
+            assertEquals("Run \$${skill.name}$expectedSuffix", vm.composer.value.text, suffix)
+            assertTrue(vm.skillSuggestions.value.isEmpty())
+        }
+        // Moving into a punctuation run must not consume just its first mark.
+        for (typedMarks in 1..2) {
+            vm.onComposerChange("$prefix::continue please", caret + typedMarks, caret + typedMarks)
+            testScheduler.runCurrent()
+            vm.selectSkillSuggestion(vm.skillSuggestions.value.single { it.skill == qualified })
+            testScheduler.runCurrent()
+            assertEquals("Run \$tools::review::continue please", vm.composer.value.text)
         }
         assertTrue(harness.api.sendCalls.value.isEmpty())
     }

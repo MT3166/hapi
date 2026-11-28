@@ -6,6 +6,7 @@ import app.hapi.companion.feature.passkey.PasskeyIssue
 import app.hapi.companion.feature.passkey.PasskeyPlatform
 import app.hapi.companion.feature.passkey.passkeyIssueOf
 import app.hapi.data.api.ApiError
+import app.hapi.data.auth.CredentialStore
 import app.hapi.data.auth.HubCredentials
 import app.hapi.data.auth.HubRegistry
 import app.hapi.data.auth.HubUrls
@@ -15,10 +16,13 @@ import app.hapi.protocol.wire.PasskeyHubAddressRequiredException
 import app.hapi.protocol.wire.SUPPORTED_PROTOCOL_VERSION
 import java.io.IOException
 import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Pairing progress; one attempt at a time. */
 sealed interface PairingUiState {
@@ -78,8 +82,9 @@ data class BindPrefill(
  */
 class PairingViewModel(
     private val clientFactory: PairingClientFactory,
+    private val credentialStore: CredentialStore,
     private val registry: HubRegistry,
-    private val commitPairing: suspend (HubCredentials) -> Unit,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val nowMs: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
 
@@ -205,12 +210,19 @@ class PairingViewModel(
 
         // A passkey sign-in replaces any previous pairing secret for this hub:
         // the stored entry authenticates by passkey session from now on.
-        return completePairing(
-            HubCredentials(
-                hubUrl = hubUrl,
-                passkeySession = login.passkeySession,
-            ).withJwt(login.token, nowMs()),
-        )
+        withContext(ioDispatcher) {
+            credentialStore.set(
+                HubCredentials(
+                    hubUrl = hubUrl,
+                    passkeySession = login.passkeySession,
+                    jwt = login.token,
+                    jwtObtainedAtMs = nowMs(),
+                )
+            )
+        }
+        registry.addHub(hubUrl, makeActive = true)
+        mutablePrefill.value = null
+        return PairingUiState.Success(hubUrl)
     }
 
     /** Cancellation → silent [PairingUiState.Idle]; everything else → an error. */
@@ -264,18 +276,21 @@ class PairingViewModel(
             return PairingUiState.Error(PairingError.Unreachable(hubUrl))
         }
 
-        return completePairing(
-            HubCredentials(
-                hubUrl = hubUrl,
-                accessToken = accessToken,
-            ).withJwt(auth.token, nowMs()),
-        )
-    }
-
-    private suspend fun completePairing(credentials: HubCredentials): PairingUiState.Success {
-        commitPairing(credentials)
+        // Credentials first, then the roster: the active-hub observer builds a
+        // HubGraph as soon as the registry flips, and it must find the secret.
+        withContext(ioDispatcher) {
+            credentialStore.set(
+                HubCredentials(
+                    hubUrl = hubUrl,
+                    accessToken = accessToken,
+                    jwt = auth.token,
+                    jwtObtainedAtMs = nowMs(),
+                )
+            )
+        }
+        registry.addHub(hubUrl, makeActive = true)
         mutablePrefill.value = null
-        return PairingUiState.Success(credentials.hubUrl)
+        return PairingUiState.Success(hubUrl)
     }
 
 }

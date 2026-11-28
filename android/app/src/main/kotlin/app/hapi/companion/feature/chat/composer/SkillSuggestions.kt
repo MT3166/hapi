@@ -20,7 +20,8 @@ internal object SkillSuggestions {
     )
     data class Edit(val text: String, val caret: Int)
 
-    private val provisionalPunctuation = charArrayOf('.', ':', '+', '#')
+    private const val sentenceMarks = ".:"
+    private val provisionalPunctuation = (sentenceMarks + "+#").toCharArray()
 
     private fun isNameChar(text: String, index: Int): Boolean {
         val char = text.getOrNull(index) ?: return false
@@ -42,27 +43,19 @@ internal object SkillSuggestions {
         isNameChar(text, index)
     }
 
-    private fun canFollowName(text: String, index: Int): Boolean {
-        val previous = text.getOrNull(index - 1)
-        return previous == '+' || previous == '#' || isNameChar(text, index - 1)
-    }
-
-    private fun isCandidateAt(text: String, index: Int, caret: Int): Boolean = when (text.getOrNull(index)) {
-        '.', ':' -> canFollowName(text, index) && (index == caret - 1 || isNameChar(text, index + 1))
-        '+', '#' -> true
-        else -> isNameChar(text, index)
+    private fun isCandidateAt(text: String, index: Int): Boolean {
+        val char = text.getOrNull(index) ?: return false
+        return char in provisionalPunctuation || isNameChar(text, index)
     }
 
     fun token(text: String, start: Int, end: Int): Token? {
         if (start != end || start !in 1..text.length) return null
         var wordStart = start - 1
-        while (isCandidateAt(text, wordStart, start)) wordStart--
+        while (isCandidateAt(text, wordStart)) wordStart--
         if (text.getOrNull(wordStart) != '$' || isNameAt(text, wordStart - 1)) return null
         var wordEnd = start
-        while (isCandidateAt(text, wordEnd, start)) wordEnd++
-        // Include one trailing mark in the forward span without scanning past it.
-        val trailing = text.getOrNull(wordEnd)
-        if ((trailing == '.' || trailing == ':') && canFollowName(text, wordEnd)) wordEnd++
+        // Scan the provisional span; only the catalogue decides where the name ends.
+        while (isCandidateAt(text, wordEnd)) wordEnd++
         val word = text.substring(wordStart, wordEnd)
         return Token(
             wordStart, wordEnd, word, text.substring(wordStart + 1, start),
@@ -85,7 +78,8 @@ internal object SkillSuggestions {
             }
             shorterWord
         } else token.word
-        var start = minOf(token.query.length + 1, word.length) // Include '$'.
+        val queryEnd = minOf(token.query.length + 1, word.length) // Include '$'.
+        var start = queryEnd
         // Treat a just-typed punctuation run as part of the name only when
         // the catalogue confirms it (including partial matches).
         while (start > 1 && word[start - 1] in provisionalPunctuation) start--
@@ -96,11 +90,13 @@ internal object SkillSuggestions {
         for (end in minOf(word.length, maxNameLength + 1) downTo boundary + 1) {
             if (end < word.length && word[end] !in provisionalPunctuation) continue
             val candidate = skillNameKey(word.substring(1, end))
-            if (end == word.length && end > token.query.length + 1 && word[end - 1] in ".:") {
-                // Beyond the caret, a trailing sentence mark needs an exact
-                // match. If both spans match, keep it unless the full name is selected.
+            val insideMarkRun = word.getOrNull(end)?.let { it in sentenceMarks } == true
+            if (word[end - 1] in sentenceMarks && (end > queryEnd || insideMarkRun)) {
+                // Do not consume sentence marks beyond the caret or split a
+                // run based on a partial match. Prefer the shorter known span
+                // unless the user picked this exact name.
                 if (candidate in knownNames &&
-                    (candidate == name || skillNameKey(word.substring(1, end - 1)) !in knownNames)
+                    (candidate == name || !hasShorterNameBeforeMarks(word, end, knownNames))
                 ) return token.start + end
                 continue
             }
@@ -108,6 +104,15 @@ internal object SkillSuggestions {
             if (partialEnd == null && candidate in name) partialEnd = end
         }
         return token.start + (partialEnd ?: boundary)
+    }
+
+    private fun hasShorterNameBeforeMarks(word: String, end: Int, knownNames: Set<String>): Boolean {
+        var shorterEnd = end
+        while (shorterEnd > 1 && word[shorterEnd - 1] in sentenceMarks) {
+            shorterEnd--
+            if (skillNameKey(word.substring(1, shorterEnd)) in knownNames) return true
+        }
+        return false
     }
 
     fun filter(skills: List<SkillSummary>, query: String, recent: List<String>): List<SkillSummary> {

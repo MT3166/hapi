@@ -27,7 +27,6 @@ import app.hapi.companion.feature.sessions.SessionListViewModel
 import app.hapi.companion.feature.sessions.formatReopenError
 import app.hapi.data.api.ApiError
 import app.hapi.data.api.ChatSessionApi
-import app.hapi.data.sse.EngineEvent
 import app.hapi.data.sse.SseEngine
 import app.hapi.data.sse.SseSubscriptionKey
 import app.hapi.data.sse.SyncEventRouter
@@ -414,7 +413,6 @@ class ChatViewModel(
 
     private val windowStore = MutableStateFlow<MessageWindowStore?>(null)
     private val detailLoadFailed = MutableStateFlow(false)
-    private val detailLoadMutex = Mutex()
 
     private var sseJob: Job? = null
     private var initJob: Job? = null
@@ -840,7 +838,6 @@ class ChatViewModel(
                 }
             }
 
-            val initialDetail = launch(workerContext) { loadDetail() }
             // Subscribe only after the window exists: every routed message
             // event / gap resync then finds a peekable window, and the
             // collector registers before `subscribe` because the engine's
@@ -848,15 +845,7 @@ class ChatViewModel(
             sseJob = scope.launch {
                 sseEngine.events(subscriptionKey)
                     .onSubscription { sseEngine.subscribe(subscriptionKey) }
-                    .collect { event ->
-                        router.route(subscriptionKey, event)
-                        if (event is EngineEvent.Handshake) launch {
-                            // The handshake may arrive while the offline REST
-                            // attempt is still failing. Do not block the stream.
-                            initialDetail.join()
-                            loadDetail(onlyIfFailed = true)
-                        }
-                    }
+                    .collect { router.route(subscriptionKey, it) }
             }
 
             launch(workerContext) {
@@ -871,6 +860,7 @@ class ChatViewModel(
                 featuresRequested = true
                 launch(workerContext) { loadFeatures() }
             }
+            withContext(workerContext) { loadDetail() }
         }
 
         // Badge count + SSE-triggered refetches while this chat is on screen.
@@ -1064,18 +1054,15 @@ class ChatViewModel(
         }
     }
 
-    private suspend fun loadDetail(onlyIfFailed: Boolean = false) = detailLoadMutex.withLock {
-        if (onlyIfFailed && !detailLoadFailed.value) return@withLock
-        val verified = try {
+    private suspend fun loadDetail() {
+        try {
             sessionStore.loadSessionDetail(sessionId)
+            detailLoadFailed.value = false
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (_: Exception) {
             detailLoadFailed.value = true
-            return@withLock
         }
-        detailLoadFailed.value = false
-        messageWindows.recoverLegacyFailedSends(sessionId, verified)
     }
 
     // ------------------------------------------------------------- composer --
